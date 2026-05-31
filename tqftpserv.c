@@ -919,6 +919,10 @@ int main(int argc, char **argv)
 	int opcode;
 	int opt;
 	int ret;
+	static const unsigned int tftp_versions[] = { 1, 3 };
+	const unsigned int nver = sizeof(tftp_versions) / sizeof(tftp_versions[0]);
+	int svc_fd[sizeof(tftp_versions) / sizeof(tftp_versions[0])];
+	unsigned int i;
 	int fd;
 
 	while ((opt = getopt(argc, argv, "dh")) != -1) {
@@ -940,22 +944,34 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	fd = qrtr_open(0);
-	if (fd < 0) {
-		fprintf(stderr, "failed to open qrtr socket\n");
-		exit(1);
-	}
+	/* Publish the TFTP service at every qrtr version a modem may look it
+	 * up under. Integrated modems use version 1; the external SDX55M
+	 * (PCIe/MHI) looks up the TFTP service at version 3 (on-wire instance
+	 * id = (instance << 8) | version). A qrtr server occupies one port per
+	 * (service, instance), so publish each version on its own socket and
+	 * service requests arriving on any of them.
+	 */
+	for (i = 0; i < nver; i++) {
+		svc_fd[i] = qrtr_open(0);
+		if (svc_fd[i] < 0) {
+			fprintf(stderr, "failed to open qrtr socket\n");
+			exit(1);
+		}
 
-	ret = qrtr_publish(fd, 4096, 1, 0);
-	if (ret < 0) {
-		fprintf(stderr, "failed to publish service registry service\n");
-		exit(1);
+		ret = qrtr_publish(svc_fd[i], 4096, tftp_versions[i], 0);
+		if (ret < 0) {
+			fprintf(stderr, "failed to publish tftp service v%u\n", tftp_versions[i]);
+			exit(1);
+		}
 	}
 
 	for (;;) {
 		FD_ZERO(&rfds);
-		FD_SET(fd, &rfds);
-		nfds = fd;
+		nfds = 0;
+		for (i = 0; i < nver; i++) {
+			FD_SET(svc_fd[i], &rfds);
+			nfds = MAX(nfds, svc_fd[i]);
+		}
 
 		list_for_each_entry(client, &writers, node) {
 			FD_SET(client->sock, &rfds);
@@ -993,7 +1009,10 @@ int main(int argc, char **argv)
 			}
 		}
 
-		if (FD_ISSET(fd, &rfds)) {
+		for (i = 0; i < nver; i++) {
+			if (!FD_ISSET(svc_fd[i], &rfds))
+				continue;
+			fd = svc_fd[i];
 			sl = sizeof(sq);
 			len = recvfrom(fd, buf, sizeof(buf), 0, (void *)&sq, &sl);
 			if (len < 0) {
@@ -1053,7 +1072,8 @@ int main(int argc, char **argv)
 		}
 	}
 
-	close(fd);
+	for (i = 0; i < nver; i++)
+		close(svc_fd[i]);
 
 	return 0;
 }
